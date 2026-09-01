@@ -20,9 +20,9 @@ so the first request of the day costs one fetch and the rest are free.  Cache
 files for days before today are pruned on every run.
 
 Requirements:
-    none for --json or --html; the default text grid needs
-    `pip install tabulate`.  Keeping the fetch and parse dependency-free lets
-    this run in a bare sandbox after nothing more than a git clone.
+    none for --json; only the default text grid needs `pip install tabulate`.
+    Keeping the fetch and parse dependency-free lets this run in a bare sandbox
+    after nothing more than a git clone.
 """
 
 from __future__ import annotations
@@ -395,92 +395,6 @@ def resolve_day(spec: str) -> date:
         ) from None
 
 
-def render_html(entries: list[SwimSession], today: str) -> str:
-    """Render the schedule as a styled HTML document suitable for Quick Look."""
-    rows_html: str = ""
-    for entry in entries:
-        icon: str = "\U0001f3ca" if "Lap" in entry.name else "\U0001f46a"
-        rows_html += (
-            f"<tr>"
-            f"<td>{icon} {entry.name}</td>"
-            f"<td>{entry.time}</td>"
-            f"<td>{entry.pool}</td>"
-            f"</tr>\n"
-        )
-
-    return f"""\
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>
-  body {{
-    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
-    margin: 20px;
-    background: #f5f5f7;
-    color: #1d1d1f;
-  }}
-  h1 {{
-    font-size: 18px;
-    font-weight: 600;
-    margin: 0 0 4px 0;
-  }}
-  .subtitle {{
-    font-size: 13px;
-    color: #86868b;
-    margin-bottom: 16px;
-  }}
-  table {{
-    width: 100%;
-    border-collapse: collapse;
-    background: #fff;
-    border-radius: 10px;
-    overflow: hidden;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-  }}
-  th {{
-    background: #0071e3;
-    color: #fff;
-    text-align: left;
-    padding: 10px 14px;
-    font-size: 13px;
-    font-weight: 600;
-  }}
-  td {{
-    padding: 10px 14px;
-    font-size: 13px;
-    border-bottom: 1px solid #f0f0f0;
-  }}
-  tr:last-child td {{
-    border-bottom: none;
-  }}
-  tr:hover {{
-    background: #f0f5ff;
-  }}
-  .footer {{
-    font-size: 11px;
-    color: #86868b;
-    margin-top: 12px;
-    text-align: center;
-  }}
-</style>
-</head>
-<body>
-  <h1>\U0001f3ca Lap + Family Swim</h1>
-  <div class="subtitle">{today} &mdash; Ridgewood YMCA</div>
-  <table>
-    <thead>
-      <tr><th>Session</th><th>Time</th><th>Pool</th></tr>
-    </thead>
-    <tbody>
-      {rows_html}
-    </tbody>
-  </table>
-  <div class="footer">{len(entries)} sessions &bull; ridgewoodymca.org</div>
-</body>
-</html>"""
-
-
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
     parser: argparse.ArgumentParser = argparse.ArgumentParser(
@@ -495,11 +409,6 @@ def parse_args() -> argparse.Namespace:
             "Day to fetch: today (default), tomorrow, yesterday, a weekday "
             "such as saturday or sat, or an ISO date such as 2026-08-15."
         ),
-    )
-    parser.add_argument(
-        "--html",
-        action="store_true",
-        help="Output an HTML table instead of a plain-text grid.",
     )
     parser.add_argument(
         "--json",
@@ -553,31 +462,25 @@ def main() -> None:
         return
 
     if not entries:
-        if args.html:
-            print(render_html([], day_label))
-        else:
-            print(f"No Lap + Family Swim classes found for {day_label}.")
+        print(f"No Lap + Family Swim classes found for {day_label}.")
         return
 
-    if args.html:
-        print(render_html(entries, day_label))
-    else:
-        try:
-            from tabulate import tabulate
-        except ImportError as exc:
-            pip: Path = Path(sys.executable).parent / "pip"
-            print(
-                f"the text table needs tabulate: {pip} install tabulate\n"
-                f"(--json needs no packages)",
-                file=sys.stderr,
-            )
-            raise SystemExit(1) from exc
+    try:
+        from tabulate import tabulate
+    except ImportError as exc:
+        pip: Path = Path(sys.executable).parent / "pip"
+        print(
+            f"the text table needs tabulate: {pip} install tabulate\n"
+            f"(--json needs no packages)",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
-        print(f"Lap + Family Swim schedule for {day_label}")
-        print(f"Source: {source}\n")
-        table_data: list[list[str]] = [entry.to_row() for entry in entries]
-        print(tabulate(table_data, headers=HEADERS, tablefmt="grid"))
-        print(f"\n{len(entries)} sessions")
+    print(f"Lap + Family Swim schedule for {day_label}")
+    print(f"Source: {source}\n")
+    table_data: list[list[str]] = [entry.to_row() for entry in entries]
+    print(tabulate(table_data, headers=HEADERS, tablefmt="grid"))
+    print(f"\n{len(entries)} sessions")
 
 
 if __name__ == "__main__":
