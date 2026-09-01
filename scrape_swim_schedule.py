@@ -14,11 +14,6 @@ column per day and the recurrence already expanded -- which is the part worth
 having, since the app's own JSON endpoint returns raw repeat rules and leaves
 the expansion to the client.  One request therefore answers seven days.
 
-Every fetched week is cached as JSON under schedule_cache/, one file per
-schedule day.  A day is served from that cache when its file was written today,
-so the first request of the day costs one fetch and the rest are free.  Cache
-files for days before today are pruned on every run.
-
 Requirements:
     none for --json; only the default text grid needs `pip install tabulate`.
     Keeping the fetch and parse dependency-free lets this run in a bare sandbox
@@ -54,10 +49,6 @@ USER_AGENT: Final[str] = (
 )
 
 REQUEST_TIMEOUT: Final[int] = 30
-
-# One JSON file per schedule day; a fetched week writes seven of them, and any
-# day is answered from here while its file is still from today.
-CACHE_DIR: Final[Path] = Path(__file__).resolve().parent / "schedule_cache"
 
 # date.weekday() numbering: Monday is 0, Sunday is 6.
 WEEKDAY_NUMBERS: Final[dict[str, int]] = {
@@ -105,62 +96,6 @@ class SwimSession:
     def to_row(self) -> list[str]:
         """Return field values in display order matching HEADERS."""
         return [self.name, self.time, self.pool]
-
-
-def cache_path(day: date) -> Path:
-    """Return the cache file for a given schedule day."""
-    return CACHE_DIR / f"schedule-{day.isoformat()}.json"
-
-
-def load_cached_schedule(day: date) -> list[SwimSession] | None:
-    """
-    Return the cached sessions for a day, or None if absent, stale or unreadable.
-
-    A file counts as stale once the calendar day turns over, so the schedule is
-    re-fetched at most once a day and edits made at the Y are picked up then.
-    """
-    path: Path = cache_path(day)
-    if not path.exists():
-        return None
-    if date.fromtimestamp(path.stat().st_mtime) != date.today():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        return [SwimSession(**item) for item in data]
-    except (json.JSONDecodeError, TypeError, OSError):
-        return None
-
-
-def save_cached_schedule(day: date, entries: list[SwimSession]) -> None:
-    """Write the scraped sessions for a day to the cache."""
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_path(day).write_text(
-        json.dumps([asdict(entry) for entry in entries], indent=2)
-    )
-
-
-def save_cached_week(week: dict[date, list[SwimSession]]) -> None:
-    """
-    Cache the still-useful days of a fetched week, empty days included.
-
-    Days already past are skipped rather than written for prune_cache to delete
-    on the next run.
-    """
-    today: date = date.today()
-    for day, entries in week.items():
-        if day >= today:
-            save_cached_schedule(day, entries)
-
-
-def prune_cache(today: date) -> None:
-    """Delete cache files for days before today; yesterday's schedule is dead weight."""
-    for path in CACHE_DIR.glob("schedule-*.json"):
-        try:
-            file_day: date = date.fromisoformat(path.stem.removeprefix("schedule-"))
-        except ValueError:
-            continue
-        if file_day < today:
-            path.unlink(missing_ok=True)
 
 
 class ScheduleUnavailable(RuntimeError):
@@ -296,7 +231,7 @@ def normalize_time(raw: str) -> str:
     Render a grid time as the '05:30 am' form used everywhere else.
 
     End times arrive as 'ends @ 9:30 AM', and neither form is zero-padded the
-    way the display and the cache expect.
+    way the display expects.
     """
     text: str = raw.strip().removeprefix("ends @").strip()
     try:
@@ -426,23 +361,13 @@ def main() -> None:
     day: date = args.day
     day_label: str = day.strftime("%A, %B %-d %Y")
 
-    prune_cache(date.today())
+    try:
+        week: dict[date, list[SwimSession]] = fetch_week(day)
+    except ScheduleUnavailable as exc:
+        print(f"Could not get the schedule for {day_label}: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
-    entries: list[SwimSession]
-    source: str
-
-    cached: list[SwimSession] | None = load_cached_schedule(day)
-    if cached is not None:
-        entries, source = cached, f"cache ({cache_path(day)})"
-    else:
-        try:
-            week: dict[date, list[SwimSession]] = fetch_week(day)
-        except ScheduleUnavailable as exc:
-            print(f"Could not get the schedule for {day_label}: {exc}", file=sys.stderr)
-            raise SystemExit(1) from exc
-        # The whole week is written, so the next six days cost no request.
-        save_cached_week(week)
-        entries, source = week[day], printer_url(day)
+    entries: list[SwimSession] = week[day]
 
     # Sort by start time
     entries.sort(key=lambda e: start_time_minutes(e.time))
@@ -477,7 +402,7 @@ def main() -> None:
         raise SystemExit(1) from exc
 
     print(f"Lap + Family Swim schedule for {day_label}")
-    print(f"Source: {source}\n")
+    print(f"Source: {printer_url(day)}\n")
     table_data: list[list[str]] = [entry.to_row() for entry in entries]
     print(tabulate(table_data, headers=HEADERS, tablefmt="grid"))
     print(f"\n{len(entries)} sessions")
