@@ -24,7 +24,9 @@ so the first request of the day costs one fetch and the rest are free.  Cache
 files for days before today are pruned on every run.
 
 Requirements:
-    pip install tabulate          # selenium is optional, for --selenium only
+    none for --json; the default text grid needs `pip install tabulate`, and
+    the --selenium fallback needs `pip install selenium`.  Keeping the fetch
+    and parse dependency-free lets this run in a bare sandbox.
 """
 
 from __future__ import annotations
@@ -42,8 +44,6 @@ from typing import TYPE_CHECKING, Final
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
-from tabulate import tabulate
 
 if TYPE_CHECKING:  # selenium is imported lazily; only the fallback needs it
     from selenium import webdriver
@@ -668,6 +668,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Output an HTML table instead of a plain-text grid.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Output the sessions as JSON on stdout, for another program to "
+            "consume.  Needs no third-party packages."
+        ),
+    )
     args: argparse.Namespace = parser.parse_args()
     if args.log_api:
         # Nothing to observe without a browser making the requests.
@@ -731,6 +739,23 @@ def main() -> None:
             save_cached_week(week)
             entries, source = week.get(day, []), printer_url(day)
 
+    # Sort by start time
+    entries.sort(key=lambda e: start_time_minutes(e.time))
+
+    if args.json:
+        # The day is echoed back so a consumer can check it got the day it
+        # asked for rather than trusting the ordering of a pipeline.
+        print(
+            json.dumps(
+                {
+                    "day": day.isoformat(),
+                    "sessions": [asdict(entry) for entry in entries],
+                },
+                indent=2,
+            )
+        )
+        return
+
     if not entries:
         if args.html:
             print(render_html([], day_label))
@@ -738,12 +763,20 @@ def main() -> None:
             print(f"No Lap + Family Swim classes found for {day_label}.")
         return
 
-    # Sort by start time
-    entries.sort(key=lambda e: start_time_minutes(e.time))
-
     if args.html:
         print(render_html(entries, day_label))
     else:
+        try:
+            from tabulate import tabulate
+        except ImportError as exc:
+            pip: Path = Path(sys.executable).parent / "pip"
+            print(
+                f"the text table needs tabulate: {pip} install tabulate\n"
+                f"(--json needs no packages)",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+
         print(f"Lap + Family Swim schedule for {day_label}")
         print(f"Source: {source}\n")
         table_data: list[list[str]] = [entry.to_row() for entry in entries]
