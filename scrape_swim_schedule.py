@@ -14,19 +14,15 @@ column per day and the recurrence already expanded -- which is the part worth
 having, since the app's own JSON endpoint returns raw repeat rules and leaves
 the expansion to the client.  One request therefore answers seven days.
 
-The Selenium path that drove the Vue app is kept behind --selenium as a
-fallback, and is the only mode in which --log-api can observe anything.  It is
-not installed by default -- `pip install selenium` first if you need it.
-
 Every fetched week is cached as JSON under schedule_cache/, one file per
 schedule day.  A day is served from that cache when its file was written today,
 so the first request of the day costs one fetch and the rest are free.  Cache
 files for days before today are pruned on every run.
 
 Requirements:
-    none for --json; the default text grid needs `pip install tabulate`, and
-    the --selenium fallback needs `pip install selenium`.  Keeping the fetch
-    and parse dependency-free lets this run in a bare sandbox.
+    none for --json or --html; the default text grid needs
+    `pip install tabulate`.  Keeping the fetch and parse dependency-free lets
+    this run in a bare sandbox after nothing more than a git clone.
 """
 
 from __future__ import annotations
@@ -35,21 +31,14 @@ import argparse
 import json
 import re
 import sys
-import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import Final
 from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-
-if TYPE_CHECKING:  # selenium is imported lazily; only the fallback needs it
-    from selenium import webdriver
-    from selenium.webdriver.remote.webelement import WebElement
-
-URL: Final[str] = "https://www.ridgewoodymca.org/classes/40"
 
 # The server-rendered view of the same schedule, which needs no browser.
 PRINTER_URL: Final[str] = "https://www.ridgewoodymca.org/classes/printer_friendly/"
@@ -70,10 +59,6 @@ REQUEST_TIMEOUT: Final[int] = 30
 # day is answered from here while its file is still from today.
 CACHE_DIR: Final[Path] = Path(__file__).resolve().parent / "schedule_cache"
 
-# Everything after this toolbar marker is the schedule proper; slicing there keeps
-# the filter chrome (e.g. "LAP + FAMILY SWIM (6)") out of the parse.
-SCHEDULE_MARKER: Final[str] = "PRINTER FRIENDLY"
-
 # date.weekday() numbering: Monday is 0, Sunday is 6.
 WEEKDAY_NUMBERS: Final[dict[str, int]] = {
     name.lower(): number
@@ -88,20 +73,6 @@ RELATIVE_DAY_OFFSETS: Final[dict[str, int]] = {
     "today": 0,
     "tomorrow": 1,
 }
-
-CLASS_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^(Lap Swim|Family Swim|Open Swim|Adult Swim|Water)", re.IGNORECASE
-)
-
-TIME_LINE_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^(?:(?:Sun|Mon|Tue|Wed|Thu|Fri|Sat)(?:\s*[-,]\s*|\s+))+"
-    r"(\d{1,2}:\d{2}\s*[ap]m)\s*-\s*(\d{1,2}:\d{2}\s*[ap]m)",
-    re.IGNORECASE,
-)
-
-BARE_TIME_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^\d{1,2}:\d{2}\s*[ap]m$"
-)
 
 START_TIME_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"(\d{1,2}):(\d{2})\s*([ap]m)", re.IGNORECASE
@@ -397,33 +368,6 @@ def fetch_week(day: date) -> dict[date, list[SwimSession]]:
     return parse_week(html_text, day)
 
 
-def create_driver(capture_network: bool = False) -> webdriver.Chrome:
-    """Create a headless Chrome WebDriver, optionally recording network traffic."""
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-    except ImportError as exc:
-        # The default path needs no browser, so selenium is not installed by
-        # default; only this fallback wants it.
-        pip: Path = Path(sys.executable).parent / "pip"
-        raise ScheduleUnavailable(
-            f"--selenium needs selenium installed: {pip} install selenium"
-        ) from exc
-
-    opts: Options = Options()
-    if capture_network:
-        # Selenium has no per-response callback, so DevTools performance logs
-        # stand in: Chrome records every request and we replay them afterwards.
-        opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    driver: webdriver.Chrome = webdriver.Chrome(options=opts)
-    return driver
-
-
 def resolve_day(spec: str) -> date:
     """
     Resolve a --day argument to a calendar date.
@@ -449,101 +393,6 @@ def resolve_day(spec: str) -> date:
             f"{spec!r} is not a day: use today/tomorrow/yesterday, "
             f"a weekday such as 'saturday' or 'sat', or an ISO date such as 2026-08-15"
         ) from None
-
-
-def schedule_url(day: date) -> str:
-    """Return the page URL that opens on a given day."""
-    return f"{URL}#day-{day.isoformat()}"
-
-
-def parse_schedule_text(text: str) -> list[SwimSession]:
-    """
-    Parse the raw text content of the schedule container for today.
-
-    The rendered text has blocks like::
-
-        05:30 am
-        Lap Swim
-        Habernickel Pool Ridgewood
-        Fri 05:30 am - 10:25 am
-    """
-    entries: list[SwimSession] = []
-    lines: list[str] = [line.strip() for line in text.split("\n") if line.strip()]
-
-    i: int = 0
-    while i < len(lines):
-        line: str = lines[i]
-
-        # Detect a class name line
-        if CLASS_NAME_PATTERN.match(line):
-            name: str = line
-            pool: str = ""
-            time_range: str = ""
-
-            # Look ahead for pool and time info
-            for j in range(i + 1, min(i + 5, len(lines))):
-                next_line: str = lines[j]
-
-                # Pool line (e.g. "Habernickel Pool Ridgewood")
-                if "pool" in next_line.lower():
-                    pool = next_line.replace(" Ridgewood", "").strip()
-                    continue
-
-                # Time line: "Fri 05:30 am - 10:25 am"
-                time_match: re.Match[str] | None = TIME_LINE_PATTERN.match(next_line)
-                if time_match:
-                    time_range = f"{time_match.group(1)} - {time_match.group(2)}"
-                    i = j
-                    break
-
-                # If we hit a bare time (next block header), stop
-                if BARE_TIME_PATTERN.match(next_line):
-                    break
-
-            entries.append(SwimSession(name=name, time=time_range, pool=pool))
-
-        i += 1
-
-    return entries
-
-
-def report_api_calls(driver: webdriver.Chrome) -> None:
-    """
-    Print the data responses the Vue app received, to reveal which endpoints it
-    hits -- and so whether any of them serve the schedule without auth.
-
-    Matching on the URL alone is not enough here: the app fetches its schedule
-    from classes.php, whose URL says neither "api" nor "json".  Selecting on the
-    XHR/Fetch resource type finds it and leaves the static assets out.
-    """
-    for record in driver.get_log("performance"):
-        message = json.loads(record["message"])["message"]
-        if message.get("method") != "Network.responseReceived":
-            continue
-        params = message["params"]
-        response = params["response"]
-        url: str = response["url"]
-        if params.get("type") in ("XHR", "Fetch") or "api" in url or "json" in url:
-            print(
-                f"  {params.get('type', '?'):5} {response['status']} {url}",
-                file=sys.stderr,
-            )
-
-
-def extract_schedule_text(driver: webdriver.Chrome) -> str:
-    """Get the visible schedule text, falling back to <body>, chrome trimmed."""
-    from selenium.webdriver.common.by import By
-
-    try:
-        container: WebElement = driver.find_element(By.ID, "classes_app")
-        text: str = container.text
-    except Exception:
-        body: WebElement = driver.find_element(By.TAG_NAME, "body")
-        text = body.text
-
-    if SCHEDULE_MARKER in text:
-        return text.split(SCHEDULE_MARKER, 1)[1]
-    return text
 
 
 def render_html(entries: list[SwimSession], today: str) -> str:
@@ -648,22 +497,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--selenium",
-        action="store_true",
-        help=(
-            "Fall back to driving the Vue page with Selenium instead of "
-            "fetching the printer-friendly view.  Always scrapes live."
-        ),
-    )
-    parser.add_argument(
-        "--log-api",
-        action="store_true",
-        help=(
-            "Print the XHR/fetch and API/JSON URLs the page requests, to "
-            "stderr.  Implies --selenium, being a diagnostic on the browser path."
-        ),
-    )
-    parser.add_argument(
         "--html",
         action="store_true",
         help="Output an HTML table instead of a plain-text grid.",
@@ -676,31 +509,7 @@ def parse_args() -> argparse.Namespace:
             "consume.  Needs no third-party packages."
         ),
     )
-    args: argparse.Namespace = parser.parse_args()
-    if args.log_api:
-        # Nothing to observe without a browser making the requests.
-        args.selenium = True
-    return args
-
-
-def scrape_schedule(day: date, log_api: bool = False) -> list[SwimSession]:
-    """Scrape the schedule for a day from the live site."""
-    driver: webdriver.Chrome = create_driver(capture_network=log_api)
-    try:
-        # First navigation of a fresh browser, so the day fragment is honoured;
-        # setting it on an already-loaded page would not re-render the Vue app.
-        driver.get(schedule_url(day))
-        time.sleep(6)  # wait for Vue app to render
-
-        if log_api:
-            print("Data responses seen by the page:", file=sys.stderr)
-            report_api_calls(driver)
-            print(file=sys.stderr)
-
-        text: str = extract_schedule_text(driver)
-        return parse_schedule_text(text)
-    finally:
-        driver.quit()
+    return parser.parse_args()
 
 
 def main() -> None:
@@ -713,31 +522,18 @@ def main() -> None:
     entries: list[SwimSession]
     source: str
 
-    if args.selenium:
+    cached: list[SwimSession] | None = load_cached_schedule(day)
+    if cached is not None:
+        entries, source = cached, f"cache ({cache_path(day)})"
+    else:
         try:
-            entries = scrape_schedule(day, log_api=args.log_api)
+            week: dict[date, list[SwimSession]] = fetch_week(day)
         except ScheduleUnavailable as exc:
             print(f"Could not get the schedule for {day_label}: {exc}", file=sys.stderr)
             raise SystemExit(1) from exc
-        source = schedule_url(day)
-        if entries:
-            # An empty parse usually means the page failed to render, so only
-            # successful scrapes are cached.
-            save_cached_schedule(day, entries)
-    else:
-        cached: list[SwimSession] | None = load_cached_schedule(day)
-        if cached is not None:
-            entries, source = cached, f"cache ({cache_path(day)})"
-        else:
-            try:
-                week: dict[date, list[SwimSession]] = fetch_week(day)
-            except ScheduleUnavailable as exc:
-                print(f"Could not get the schedule for {day_label}: {exc}", file=sys.stderr)
-                print("Retry with --selenium to drive the page in a browser.", file=sys.stderr)
-                raise SystemExit(1) from exc
-            # The whole week is written, so the next six days cost no request.
-            save_cached_week(week)
-            entries, source = week.get(day, []), printer_url(day)
+        # The whole week is written, so the next six days cost no request.
+        save_cached_week(week)
+        entries, source = week[day], printer_url(day)
 
     # Sort by start time
     entries.sort(key=lambda e: start_time_minutes(e.time))
